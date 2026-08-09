@@ -114,7 +114,7 @@ def stratified_sample(items: list[dict], limit: int, rng: random.Random) -> list
 async def judge_once(llm: LLMClient, item: dict, answer: str) -> tuple[str, str]:
     """Run the benchmark's judge on one answer.
 
-    Returns (verdict, reasoning) where verdict is CORRECT, WRONG or PARSE_FAIL.
+    Returns (verdict, reasoning) where verdict is CORRECT, WRONG or NO_VERDICT.
 
     The benchmark collapses a malformed judge response into WRONG
     (``locomo/run.py``: ``correct = False`` when the parse yields a non-dict).
@@ -122,18 +122,25 @@ async def judge_once(llm: LLMClient, item: dict, answer: str) -> tuple[str, str]
     indistinguishable from the judge correctly rejecting an adversarial answer,
     which would silently flatter the judge. So it is kept as its own outcome and
     excluded from the rates below.
+
+    It is called NO_VERDICT rather than PARSE_FAIL because it cannot be narrowed
+    to a parse failure: ``generate_structured`` returns ``{}`` after exhausting
+    its retries, identically for a rate limit, a timeout and genuinely malformed
+    output. Naming it for one of the three would be a label the data does not
+    support. Its only sound reading is "no usable verdict", and a run whose
+    no_verdict count is large is a run to repeat, not to interpret.
     """
     prompt = get_judge_prompt(item["category"], item["question"], item["gold"], answer)
     try:
         raw = await llm.generate_structured(system=JUDGE_SYSTEM_PROMPT, user=prompt)
     except Exception as exc:  # noqa: BLE001 - one bad call must not end the run
-        return "PARSE_FAIL", f"{type(exc).__name__}: {exc}"
+        return "NO_VERDICT", f"{type(exc).__name__}: {exc}"
     if not isinstance(raw, dict) or "label" not in raw:
-        return "PARSE_FAIL", str(raw)[:200]
+        return "NO_VERDICT", str(raw)[:200]
     label = str(raw.get("label", "")).upper()
     reasoning = str(raw.get("reasoning", ""))[:300]
     if label not in {"CORRECT", "WRONG"}:
-        return "PARSE_FAIL", f"label={label!r}"
+        return "NO_VERDICT", f"label={label!r}"
     return label, reasoning
 
 
@@ -155,6 +162,8 @@ async def run(args: argparse.Namespace) -> dict:
         api_key=args.api_key or os.getenv("OPENAI_API_KEY"),
         base_url=args.base_url,
         rpm=args.rpm,
+        timeout=args.timeout,
+        max_retries=args.max_retries,
     )
 
     kinds = args.perturbations or list(PERTURBATIONS)
@@ -207,13 +216,13 @@ def summarise(records: list[dict], args: argparse.Namespace) -> dict:
         rows[kind] = {
             "n_attempted": sum(c.values()),
             "n_judged": judged,
-            "parse_failures": c["PARSE_FAIL"],
+            "no_verdict": c["NO_VERDICT"],
             "accepted": c["CORRECT"],
             "accept_rate_pct": round(c["CORRECT"] / judged * 100, 2) if judged else None,
         }
 
     # Control: does re-judging an unchanged answer reproduce the stored verdict?
-    ident = [r for r in records if r["perturbation"] == "identity" and r["verdict"] != "PARSE_FAIL"]
+    ident = [r for r in records if r["perturbation"] == "identity" and r["verdict"] != "NO_VERDICT"]
     agree = sum(1 for r in ident if r["verdict"] == r["published_judgment"])
     consistency = {
         "n": len(ident),
@@ -234,6 +243,8 @@ def summarise(records: list[dict], args: argparse.Namespace) -> dict:
             "published_judge_model": "gpt-5",
             "seed": args.seed,
             "concurrency": args.concurrency,
+            "timeout_s": args.timeout,
+            "max_retries": args.max_retries,
         },
         "leniency": rows,
         "consistency": consistency,
@@ -278,6 +289,12 @@ def main() -> None:
     p.add_argument("--api-key", default=None)
     p.add_argument("--rpm", type=int, default=200)
     p.add_argument("--concurrency", type=int, default=8)
+    # A judge call is ~500 tokens in and ~50 out. The client's 120s default is
+    # never a legitimate wait for that, and a stuck call holds a concurrency
+    # slot for timeout x max_retries -- 10 minutes at the defaults, which is
+    # what collapsed the first run's throughput.
+    p.add_argument("--timeout", type=float, default=45.0, help="Per-call timeout, seconds")
+    p.add_argument("--max-retries", type=int, default=3)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--perturbations", nargs="*", choices=PERTURBATIONS, default=None)
     p.add_argument("--out", default="results/audit/judge_audit.json")

@@ -46,11 +46,18 @@ no date to shift, no name to swap. Those items are excluded from the
 denominator rather than scored, so each rate is against the population that
 actually received the treatment.
 
-**Parse failures are held out of every rate.** `locomo/run.py` collapses a
+**Failed calls are held out of every rate.** `locomo/run.py` collapses a
 malformed judge response into `WRONG` (`correct = False` on a non-dict). That is
 safe for scoring but would be fatal here: a timeout would be indistinguishable
 from the judge correctly rejecting an adversarial answer, and would silently
-flatter it. `PARSE_FAIL` is its own outcome and is reported separately.
+flatter it. `NO_VERDICT` is its own outcome and is reported separately.
+
+It is `NO_VERDICT`, not `PARSE_FAIL`, because the client returns `{}` after
+exhausting retries — identically for a rate limit, a timeout and genuinely
+malformed output. Calling it a parse failure would name a cause the data does
+not distinguish. **A run with a large `no_verdict` count is one to repeat, not
+to interpret**: the excluded items are not a random sample, since a judge is
+likeliest to stall on the longest prompts.
 
 ## Ceilings
 
