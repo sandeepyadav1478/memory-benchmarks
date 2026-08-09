@@ -11,6 +11,7 @@ Shared metrics helpers for all benchmarks:
 
 from __future__ import annotations
 
+import math
 import statistics
 from collections import defaultdict
 from typing import Any
@@ -141,6 +142,61 @@ def compute_overall_metrics(
             )
 
     return metrics
+
+
+def _percentile(values: list[float], q: float) -> float:
+    """Nearest-rank percentile — unambiguous, and what o11y tooling reports."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    idx = max(0, math.ceil(q / 100 * len(ordered)) - 1)
+    return ordered[idx]
+
+
+def compute_cost_metrics(
+    evaluations: list[dict[str, Any]],
+    cutoff_label: str | None = None,
+) -> dict[str, float]:
+    """Latency percentiles and token means for a run.
+
+    Latency is reported as p50/p95 rather than a mean: retrieval latency is
+    right-skewed, so a mean is dominated by the tail and is not comparable to a
+    published p50. Token figures cover the answering model only (the context cost
+    of a query), not the judge, which does not exist in production.
+
+    Note that these latencies are measured under whatever concurrency the run
+    used, so they are only interpretable alongside ``max_workers`` in metadata.
+    """
+    # The benchmarks disagree on where this lives: locomo and beam write it at
+    # item top level, longmemeval nests it under "retrieval" (the schema
+    # location). Read both so this works on already-published results too.
+    search: list[float] = []
+    for e in evaluations:
+        ms = e.get("search_latency_ms")
+        if ms is None:
+            ms = (e.get("retrieval") or {}).get("search_latency_ms")
+        if ms:
+            search.append(ms)
+
+    prompt: list[float] = []
+    completion: list[float] = []
+    for e in evaluations:
+        src = (e.get("cutoff_results", {}) or {}).get(cutoff_label, {}) if cutoff_label else e
+        if src.get("prompt_tokens") is not None:
+            prompt.append(src["prompt_tokens"])
+            completion.append(src.get("completion_tokens") or 0)
+
+    out = {
+        "search_latency_p50_ms": round(_percentile(search, 50), 1),
+        "search_latency_p95_ms": round(_percentile(search, 95), 1),
+        "search_latency_mean_ms": round(statistics.mean(search), 1) if search else 0.0,
+        "n_latency_samples": len(search),
+    }
+    if prompt:
+        out["mean_prompt_tokens"] = round(statistics.mean(prompt), 1)
+        out["mean_completion_tokens"] = round(statistics.mean(completion), 1)
+        out["n_token_samples"] = len(prompt)
+    return out
 
 
 def compute_kendall_tau_b(predicted_order: list[int], reference_order: list[int]) -> float:

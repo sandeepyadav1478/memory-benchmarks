@@ -14,6 +14,7 @@ Includes retry logic and rate limiting.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -25,6 +26,39 @@ from aiolimiter import AsyncLimiter
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+# -----------------------------------------------------------------------------
+# Token accounting
+# -----------------------------------------------------------------------------
+# Both SDKs already report exact usage on every response, so nothing needs to be
+# re-tokenized locally. Accounting is per-task rather than per-client because one
+# LLMClient is shared by max_workers concurrent items: asyncio copies the context
+# at Task creation, so sibling items accumulate into their own bucket.
+
+_EMPTY_USAGE = {"prompt_tokens": 0, "completion_tokens": 0, "llm_calls": 0}
+
+_usage: contextvars.ContextVar[dict[str, int] | None] = contextvars.ContextVar("llm_usage", default=None)
+
+
+def start_usage() -> None:
+    """Begin token accounting for the current eval item. Call once per item."""
+    _usage.set(dict(_EMPTY_USAGE))
+
+
+def get_usage() -> dict[str, int]:
+    """Tokens billed to the current item. Zeros if accounting was never started."""
+    return dict(_usage.get() or _EMPTY_USAGE)
+
+
+def _record_usage(resp: Any) -> None:
+    """Accumulate SDK-reported usage; OpenAI and Anthropic name the fields differently."""
+    bucket = _usage.get()
+    usage = getattr(resp, "usage", None)
+    if bucket is None or usage is None:
+        return
+    bucket["prompt_tokens"] += getattr(usage, "prompt_tokens", 0) or getattr(usage, "input_tokens", 0) or 0
+    bucket["completion_tokens"] += getattr(usage, "completion_tokens", 0) or getattr(usage, "output_tokens", 0) or 0
+    bucket["llm_calls"] += 1
 
 
 class LLMClient:
@@ -173,6 +207,7 @@ class LLMClient:
                         ),
                         timeout=self.timeout,
                     )
+                _record_usage(resp)
                 content = resp.choices[0].message.content
                 if content is None:
                     logger.warning(
@@ -208,6 +243,7 @@ class LLMClient:
                         self._client.messages.create(**kwargs),
                         timeout=self.timeout,
                     )
+                _record_usage(resp)
                 content = resp.content[0].text if resp.content else ""
                 return content.strip()
             except asyncio.TimeoutError:
@@ -275,6 +311,7 @@ class LLMClient:
                         ),
                         timeout=self.timeout,
                     )
+                _record_usage(resp)
                 raw = resp.choices[0].message.content
                 if not raw:
                     if attempt < self.max_retries - 1:
@@ -335,6 +372,7 @@ class LLMClient:
                         self._client.messages.create(**kwargs),
                         timeout=self.timeout,
                     )
+                _record_usage(resp)
                 raw = resp.content[0].text if resp.content else ""
                 raw = raw.strip()
 

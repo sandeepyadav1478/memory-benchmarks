@@ -42,9 +42,9 @@ from typing import Any
 from dotenv import load_dotenv
 from tqdm import tqdm
 
-from benchmarks.common.llm_client import LLMClient
+from benchmarks.common.llm_client import LLMClient, get_usage, start_usage
 from benchmarks.common.mem0_client import Mem0Client, format_search_results
-from benchmarks.common.metrics import compute_overall_metrics
+from benchmarks.common.metrics import compute_cost_metrics, compute_overall_metrics
 from benchmarks.common.schema import (
     CutoffResult,
     EvalItem,
@@ -412,6 +412,8 @@ async def process_question(
     category = qa["category"]
     answer = str(qa["answer"])
 
+    start_usage()
+
     # --- Search ---
     start = time.monotonic()
     search_results = await mem0.search(question, user_id, top_k=top_k, score_debug=score_debug)
@@ -463,7 +465,11 @@ async def process_question(
 
         # Generate answer
         gen_prompt = get_answer_generation_prompt(question, sliced, reference_date=reference_date_human, user_profile=user_profile)
+        before = get_usage()
         generated_answer = await answerer.generate(system="", user=gen_prompt)
+        answer_usage = {
+            k: get_usage()[k] - before[k] for k in ("prompt_tokens", "completion_tokens")
+        }
         if "ANSWER:" in generated_answer:
             generated_answer = generated_answer.rsplit("ANSWER:", 1)[-1].strip()
 
@@ -492,9 +498,16 @@ async def process_question(
             "generated_answer": generated_answer,
             "memories_evaluated": len(sliced),
             "reason": raw.get("reasoning", "") if isinstance(raw, dict) else "",
+            # Context sent to the answering model at this cutoff. This is the
+            # "tokens per query" figure; judge tokens are deliberately excluded.
+            "prompt_tokens": answer_usage["prompt_tokens"],
+            "completion_tokens": answer_usage["completion_tokens"],
         }
 
     result["cutoff_results"] = cutoff_results
+    # Whole-item spend, answerer + judge across every cutoff. This is the cost of
+    # running the benchmark, which is a different quantity from the line above.
+    result["usage"] = get_usage()
     return result
 
 
@@ -652,6 +665,7 @@ def compute_locomo_metrics(evaluations: list[dict], cutoffs: list[int]) -> dict:
                 "avg_score": statistics.mean(scores) * 100 if scores else 0.0,
             },
             "by_category": cat_metrics,
+            "cost": compute_cost_metrics(evaluations, cutoff_label=label),
         }
     return metrics_by_cutoff
 
@@ -817,6 +831,7 @@ async def async_main() -> None:
                 "top_k": args.top_k,
                 "top_k_cutoffs": [cutoff_label(c) for c in cutoffs],
                 "total_questions": len(all_evaluations),
+                "max_workers": args.max_workers,
                 "categories": categories,
                 "evaluate_only": True,
             },
@@ -963,6 +978,7 @@ async def async_main() -> None:
                     "top_k": args.top_k,
                     "top_k_cutoffs": [cutoff_label(c) for c in cutoffs],
                     "total_questions": len(all_evaluations),
+                "max_workers": args.max_workers,
                     "categories": categories,
                 },
                 "metrics_by_cutoff": metrics,
