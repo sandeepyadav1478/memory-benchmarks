@@ -39,6 +39,7 @@ import json
 import os
 import random
 import sys
+import urllib.request
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -111,6 +112,55 @@ def stratified_sample(items: list[dict], limit: int, rng: random.Random) -> list
     return out
 
 
+class OllamaJudge:
+    """Drop-in for ``LLMClient`` that speaks ollama's native API.
+
+    Exists for one reason: litellm's ``ollama_chat`` path silently drops
+    ``enable_thinking``, so a reasoning model spends its entire token budget in
+    the thinking block and returns ``content: ''``. Measured on
+    ``vibeforged-14b`` (Qwen3.6-14B-A3B): 512 tokens consumed, empty content,
+    every time. The native endpoint accepts ``think: False`` and a JSON schema,
+    which turns the same call into a 7-token verdict in 0.4s.
+
+    That matters beyond convenience -- it is the difference between a local
+    judge being unusable and running the full audit in minutes at no cost.
+    """
+
+    SCHEMA = {
+        "type": "object",
+        "properties": {"label": {"type": "string", "enum": ["CORRECT", "WRONG"]},
+                       "reasoning": {"type": "string"}},
+        "required": ["label"],
+    }
+
+    def __init__(self, model: str, base_url: str = "http://localhost:11434",
+                 timeout: float = 60.0):
+        self.model, self.base_url, self.timeout = model, base_url.rstrip("/"), timeout
+
+    def _post(self, system: str, user: str) -> dict:
+        body = json.dumps({
+            "model": self.model,
+            "messages": [{"role": "system", "content": system},
+                         {"role": "user", "content": user}],
+            "stream": False, "think": False, "format": self.SCHEMA,
+            "options": {"temperature": 0, "num_predict": 300},
+        }).encode()
+        req = urllib.request.Request(f"{self.base_url}/api/chat", data=body,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=self.timeout) as r:
+            content = json.load(r)["message"]["content"]
+        # Schema-enforced, but a truncated generation can still be invalid JSON.
+        # Returning {} matches LLMClient's contract so judge_once maps it to
+        # NO_VERDICT rather than to a wrong answer.
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            return {}
+
+    async def generate_structured(self, system: str, user: str) -> dict:
+        return await asyncio.to_thread(self._post, system, user)
+
+
 async def judge_once(llm: LLMClient, item: dict, answer: str) -> tuple[str, str]:
     """Run the benchmark's judge on one answer.
 
@@ -156,15 +206,22 @@ async def run(args: argparse.Namespace) -> dict:
 
     name_pool = sorted({n for it in all_items for n in _names(it["question"])})
 
-    llm = LLMClient(
-        model=args.model,
-        provider=args.provider,
-        api_key=args.api_key or os.getenv("OPENAI_API_KEY"),
-        base_url=args.base_url,
-        rpm=args.rpm,
-        timeout=args.timeout,
-        max_retries=args.max_retries,
-    )
+    if args.provider == "ollama":
+        llm = OllamaJudge(
+            model=args.model,
+            base_url=args.base_url or "http://localhost:11434",
+            timeout=args.timeout,
+        )
+    else:
+        llm = LLMClient(
+            model=args.model,
+            provider=args.provider,
+            api_key=args.api_key or os.getenv("OPENAI_API_KEY"),
+            base_url=args.base_url,
+            rpm=args.rpm,
+            timeout=args.timeout,
+            max_retries=args.max_retries,
+        )
 
     kinds = args.perturbations or list(PERTURBATIONS)
     jobs = []
@@ -257,14 +314,14 @@ def report(summary: dict) -> None:
     print("\n" + "=" * 72)
     print(f"judge under test : {cfg['judge_model']}   (published runs used {cfg['published_judge_model']})")
     print("=" * 72)
-    print(f"{'perturbation':<16}{'judged':>8}{'accepted':>10}{'accept %':>10}{'parse fail':>12}")
+    print(f"{'perturbation':<16}{'judged':>8}{'accepted':>10}{'accept %':>10}{'no verdict':>12}")
     for kind in PERTURBATIONS:
         r = summary["leniency"].get(kind)
         if not r:
             continue
         expected = "control" if kind in EXPECT_CORRECT else "false accepts"
         rate = "n/a" if r["accept_rate_pct"] is None else f"{r['accept_rate_pct']:.1f}"
-        print(f"{kind:<16}{r['n_judged']:>8}{r['accepted']:>10}{rate:>10}{r['parse_failures']:>12}   {expected}")
+        print(f"{kind:<16}{r['n_judged']:>8}{r['accepted']:>10}{rate:>10}{r['no_verdict']:>12}   {expected}")
     c = summary["consistency"]
     print(f"\ncontrol agreement with stored verdicts: {c['agreed_with_published']}/{c['n']} "
           f"(flip rate {c['flip_rate_pct']}%)")
