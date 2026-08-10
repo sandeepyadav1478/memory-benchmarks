@@ -59,9 +59,68 @@ not distinguish. **A run with a large `no_verdict` count is one to repeat, not
 to interpret**: the excluded items are not a random sample, since a judge is
 likeliest to stall on the longest prompts.
 
+## Retrieval-depth churn
+
+```bash
+python -m benchmarks.audit.depth_churn      # no API key, reads committed results only
+```
+
+Every platform benchmark ships at two retrieval depths over the same questions,
+and the reported difference between them is a **net** figure. Net movement and
+total movement are different quantities, and here they differ by up to 4.9x:
+
+| benchmark | n | top_50 | top_200 | net | items that flip | gained | regressed |
+|---|---|---|---|---|---|---|---|
+| locomo | 1539 | 82.66% | 91.56% | +8.90 | 191 (12.41%) | 164 | 27 |
+| longmemeval | 500 | 90.40% | 93.40% | +3.00 | 35 (7.00%) | 25 | 10 |
+| beam_1m | 700 | 67.14% | 70.14% | +3.00 | 103 (14.71%) | 62 | 41 |
+| beam_10m | 200 | 45.50% | 50.50% | +5.00 | 38 (19.00%) | 24 | 14 |
+
+`beam_1m` is the clearest case: a +3.00 point gain is **62 improvements against
+41 regressions**. The headline is accurate and it describes two fifths less
+movement than actually happened.
+
+**Deeper retrieval is not uniformly better, and where it hurts is explainable.**
+`contradiction_resolution` is the worst-regressing category in both BEAM runs —
+30.0% on `beam_10m`, 14.3% on `beam_1m` — which is what you would predict:
+retrieving more memories surfaces more mutually inconsistent ones, and
+reconciling them *is* the task. On LOCOMO the regressions concentrate in
+`open-domain` (4.2%) and `temporal` (2.5%).
+
+Checked and **not** the explanation: BEAM's correctness is a threshold
+(`score >= 0.5`) on a continuous rubric score, so flips could have been the cut
+wobbling under trivial score changes. They are not — only 1.9% (`beam_1m`) and
+0% (`beam_10m`) of flips involve a score move of 0.1 or less.
+
+### Judge self-consistency
+
+Both LOCOMO runs record `with_evidence: False`, and `get_judge_prompt` is a pure
+function of (question, gold, answer) — it takes `category` and does not use it.
+So an item whose generated answer is byte-identical across the two runs gave the
+judge a byte-identical prompt.
+
+**407 such items on LOCOMO; 1 changed verdict (0.25%).** That is
+`conv0_q68` — gold "Since 2016", answer "Seven years." in both runs, CORRECT at
+top_50 and WRONG at top_200. BEAM shows 0 of 69 and 0 of 37.
+
+This **corroborates** mem0's own disclosure of "a ±1 point confidence interval
+due to judge inconsistency" rather than disputing it. Quote it that way.
+
 ## Ceilings
 
 Read these before quoting any number.
+
+- **`depth_churn.py` asserts its recomputation against each file's own
+  `metrics_by_cutoff` before reporting anything.** If a verdict convention is
+  misread the run dies rather than publishing a number. That is the only reason
+  these figures can be trusted without re-judging anything.
+- **BEAM's `>= 0.5` correctness threshold is derived, not documented.** It is
+  justified solely by reproducing all four published `correct` counts exactly
+  (491, 470, 101, 91). If mem0 uses a different rule that happens to agree on
+  these four files, the churn figures move.
+- **Churn is not error.** An item flipping between depths is the expected
+  behaviour of a retrieval change. The claim here is only that the net figure
+  is a lossy summary of it, and that the regressions have structure.
 
 - **The published runs judged with `gpt-5`.** Any other judge model measures how
   *this prompt* behaves under *that* model. That is a claim about the prompt's
